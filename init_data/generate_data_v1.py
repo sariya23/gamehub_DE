@@ -9,9 +9,17 @@ data/raw/
 │   └── users.csv
 ├── developer_portal/
 │   ├── developers.csv
-│   └── published_games.csv
+│   └── published_games.csv  # only games added through developer portal
 ├── game_catalog/
-│   └── games.json
+│   ├── games.json
+│   ├── genres.csv
+│   ├── tags.csv
+│   ├── platforms.csv
+│   ├── languages.csv
+│   ├── game_genres.csv
+│   ├── game_tags.csv
+│   ├── game_platforms.csv
+│   └── game_languages.csv
 ├── library_service/
 │   └── library.csv
 ├── anti_library_service/
@@ -30,7 +38,7 @@ Install dependency for parquet:
 
 Run:
     python generate_gamehub_data.py
-    python generate_gamehub_data.py --users 10000 --games 1000 --developers 200 --out data/raw
+    python generate_gamehub_data.py --users 10000 --games 1000 --developers 200 --dirty-rate 0.04 --out data/raw
 """
 
 from __future__ import annotations
@@ -66,11 +74,18 @@ TAGS = [
     "atmospheric", "short", "early_access", "controller_support",
 ]
 
+GENRE_IDS = {genre: f"genre_{i:03d}" for i, genre in enumerate(GENRES, start=1)}
+TAG_IDS = {tag: f"tag_{i:03d}" for i, tag in enumerate(TAGS, start=1)}
+
 PLATFORMS = [
     "windows", "macos", "linux", "steam_deck",
     "playstation", "xbox", "nintendo_switch",
 ]
 LANGUAGES = ["en", "ru", "de", "fr", "es", "pt", "ja", "ko", "zh"]
+
+PLATFORM_IDS = {platform: f"platform_{i:03d}" for i, platform in enumerate(PLATFORMS, start=1)}
+LANGUAGE_IDS = {language: f"language_{i:03d}" for i, language in enumerate(LANGUAGES, start=1)}
+
 PLACEMENTS = ["home_top", "genre_page", "search_results", "game_page_sidebar", "library_recommendations"]
 EVENT_TYPES = ["game_view", "library_add", "anti_library_add", "review_view", "promo_impression", "promo_click"]
 COMPLETION_STATUSES = ["not_started", "playing", "completed", "dropped"]
@@ -90,6 +105,7 @@ class Config:
     anti_library_max: int
     campaigns: int
     events: int
+    dirty_rate: float
     start_date: datetime
     end_date: datetime
 
@@ -105,6 +121,29 @@ def random_dt(start: datetime, end: datetime) -> datetime:
 
 def weighted_choice(items: list[str], weights: list[float]) -> str:
     return random.choices(items, weights=weights, k=1)[0]
+
+
+def dirty_p(cfg: Any, multiplier: float = 1.0) -> float:
+    """Return bounded probability for soft data quality issues."""
+    return max(0.0, min(0.35, cfg.dirty_rate * multiplier))
+
+
+def maybe_none(value: Any, cfg: Any, multiplier: float = 1.0) -> Any:
+    return None if random.random() < dirty_p(cfg, multiplier) else value
+
+
+def maybe_blank(value: Any, cfg: Any, multiplier: float = 1.0) -> Any:
+    return "" if random.random() < dirty_p(cfg, multiplier) else value
+
+
+def maybe_dirty_country(value: str, cfg: Any) -> str | None:
+    """Keep country mostly clean, but sometimes missing or badly cased."""
+    roll = random.random()
+    if roll < dirty_p(cfg, 0.35):
+        return None
+    if roll < dirty_p(cfg, 0.55):
+        return value.lower()
+    return value
 
 
 def ensure_dirs(out: Path) -> dict[str, Path]:
@@ -157,8 +196,8 @@ def make_users(cfg: Config) -> list[dict[str, Any]]:
                 "user_id": user_id,
                 "username": f"user_{i:07d}",
                 "email": f"user_{i:07d}@gamehub.example",
-                "country": random.choice(COUNTRIES),
-                "birth_year": random.randint(1975, 2012),
+                "country": maybe_dirty_country(random.choice(COUNTRIES), cfg),
+                "birth_year": maybe_none(random.randint(1975, 2012), cfg, 0.9),
                 "registered_at": dt_to_iso(registered_at),
                 "account_status": weighted_choice(
                     ["active", "blocked", "deleted"],
@@ -183,8 +222,8 @@ def make_developers(cfg: Config) -> list[dict[str, Any]]:
         developers.append(
             {
                 "developer_id": developer_id,
-                "studio_name": f"{random.choice(prefixes)}_{random.choice(suffixes)}_{i:04d}",
-                "country": random.choice(COUNTRIES),
+                "studio_name": maybe_blank(f"{random.choice(prefixes)}_{random.choice(suffixes)}_{i:04d}", cfg, 0.1),
+                "country": maybe_dirty_country(random.choice(COUNTRIES), cfg),
                 "created_at": dt_to_iso(created_at),
                 "verification_status": weighted_choice(
                     ["verified", "pending", "rejected"],
@@ -196,7 +235,22 @@ def make_developers(cfg: Config) -> list[dict[str, Any]]:
     return developers
 
 
-def make_games(cfg: Config, developers: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def make_games(
+    cfg: Config,
+    users: list[dict[str, Any]],
+    developers: list[dict[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     adjectives = [
         "ancient", "neon", "silent", "broken", "cosmic", "tiny", "lost", "furious",
         "hidden", "crimson", "golden", "frozen", "electric", "lonely", "wild",
@@ -206,21 +260,78 @@ def make_games(cfg: Config, developers: list[dict[str, Any]]) -> tuple[list[dict
         "storm", "signal", "island", "station", "garden", "citadel", "planet", "archive",
     ]
 
-    verified_devs = [d for d in developers if d["verification_status"] != "rejected"]
-    if not verified_devs:
-        verified_devs = developers
+    genre_rows = [
+        {
+            "genre_id": GENRE_IDS[genre],
+            "genre_name": genre,
+            "created_at": dt_to_iso(cfg.start_date),
+        }
+        for genre in GENRES
+    ]
+
+    tag_rows = [
+        {
+            "tag_id": TAG_IDS[tag],
+            "tag_name": tag,
+            "created_at": dt_to_iso(cfg.start_date),
+        }
+        for tag in TAGS
+    ]
+
+    platform_rows = [
+        {
+            "platform_id": PLATFORM_IDS[platform],
+            "platform_name": platform,
+            "created_at": dt_to_iso(cfg.start_date),
+        }
+        for platform in PLATFORMS
+    ]
+
+    language_rows = [
+        {
+            "language_id": LANGUAGE_IDS[language],
+            "language_code": language,
+            "created_at": dt_to_iso(cfg.start_date),
+        }
+        for language in LANGUAGES
+    ]
+
+    active_users = [u for u in users if u["account_status"] == "active"]
+    if not active_users:
+        active_users = users
+
+    known_devs = [d for d in developers if d["verification_status"] != "rejected"]
+    if not known_devs:
+        known_devs = developers
 
     games = []
     published_games = []
+    game_genre_rows = []
+    game_tag_rows = []
+    game_platform_rows = []
+    game_language_rows = []
 
     for i in range(1, cfg.games + 1):
         game_id = f"g_{i:07d}"
-        developer = random.choice(verified_devs)
+
+        # developer_id is the real developer/owner of the game.
+        developer = random.choice(known_devs)
+
+        # added_by_* describes who added the game to the GameHub catalog.
+        # A game can be added either by its developer or by a regular user.
+        added_by_type = weighted_choice(["developer", "user"], [0.42, 0.58])
+        added_by_developer_id = developer["developer_id"] if added_by_type == "developer" else None
+        added_by_user_id = random.choice(active_users)["user_id"] if added_by_type == "user" else None
+
         release_date = random_dt(cfg.start_date + timedelta(days=30), cfg.end_date - timedelta(days=5))
+        catalog_created_at = release_date - timedelta(days=random.randint(7, 120))
+
         main_genre = random.choice(GENRES)
         other_genres = random.sample([g for g in GENRES if g != main_genre], k=random.randint(0, 2))
         game_genres = [main_genre] + other_genres
         game_tags = random.sample(TAGS, k=random.randint(3, 8))
+        game_platforms = random.sample(PLATFORMS, k=random.randint(1, len(PLATFORMS)))
+        game_languages = random.sample(LANGUAGES, k=random.randint(1, min(5, len(LANGUAGES))))
 
         publication_status = weighted_choice(
             ["published", "early_access", "unlisted"],
@@ -234,32 +345,83 @@ def make_games(cfg: Config, developers: list[dict[str, Any]]) -> tuple[list[dict
                 "game_id": game_id,
                 "developer_id": developer["developer_id"],
                 "title": f"{random.choice(adjectives).title()} {random.choice(nouns).title()} {i}",
-                "description": f"Synthetic {main_genre} game generated for GameHub data engineering practice.",
-                "genres": game_genres,
-                "tags": game_tags,
-                "platforms": random.sample(PLATFORMS, k=random.randint(1, len(PLATFORMS))),
-                "languages": random.sample(LANGUAGES, k=random.randint(1, min(5, len(LANGUAGES)))),
-                "age_rating": random.choice(["3+", "7+", "12+", "16+", "18+"]),
-                "price_usd": price,
-                "release_date": release_date.date().isoformat(),
-                "catalog_created_at": dt_to_iso(release_date - timedelta(days=random.randint(7, 120))),
+                "description": maybe_none(
+                    maybe_blank(f"Synthetic {main_genre} game generated for GameHub data engineering practice.", cfg, 0.3),
+                    cfg,
+                    0.55,
+                ),
+                "age_rating": maybe_none(random.choice(["3+", "7+", "12+", "16+", "18+"]), cfg, 0.6),
+                "price_usd": maybe_none(price, cfg, 0.25),
+                "release_date": maybe_none(release_date.date().isoformat(), cfg, 0.2),
+                "catalog_created_at": dt_to_iso(catalog_created_at),
+                "added_by_type": added_by_type,
+                "added_by_user_id": added_by_user_id,
+                "added_by_developer_id": added_by_developer_id,
                 "is_free": price == 0,
                 "publication_status": publication_status,
             }
         )
 
-        published_games.append(
-            {
-                "developer_id": developer["developer_id"],
-                "game_id": game_id,
-                "submitted_at": dt_to_iso(release_date - timedelta(days=random.randint(7, 120))),
-                "published_at": dt_to_iso(release_date),
-                "publication_status": publication_status,
-                "moderation_score": round(random.uniform(0.55, 0.99), 3),
-            }
-        )
+        for position, genre in enumerate(game_genres, start=1):
+            game_genre_rows.append(
+                {
+                    "game_id": game_id,
+                    "genre_id": GENRE_IDS[genre],
+                    "is_primary": position == 1,
+                    "position": position,
+                }
+            )
 
-    return games, published_games
+        for tag in game_tags:
+            game_tag_rows.append(
+                {
+                    "game_id": game_id,
+                    "tag_id": TAG_IDS[tag],
+                }
+            )
+
+        for platform in game_platforms:
+            game_platform_rows.append(
+                {
+                    "game_id": game_id,
+                    "platform_id": PLATFORM_IDS[platform],
+                }
+            )
+
+        for language in game_languages:
+            game_language_rows.append(
+                {
+                    "game_id": game_id,
+                    "language_id": LANGUAGE_IDS[language],
+                }
+            )
+
+        # Developer Portal contains only games that were added through the developer flow.
+        # User-added catalog entries do not appear in this source.
+        if added_by_type == "developer":
+            published_games.append(
+                {
+                    "developer_id": developer["developer_id"],
+                    "game_id": game_id,
+                    "submitted_at": maybe_none(dt_to_iso(catalog_created_at), cfg, 0.25),
+                    "published_at": dt_to_iso(release_date),
+                    "publication_status": publication_status,
+                    "moderation_score": maybe_none(round(random.uniform(0.55, 0.99), 3), cfg, 0.8),
+                }
+            )
+
+    return (
+        games,
+        published_games,
+        genre_rows,
+        tag_rows,
+        platform_rows,
+        language_rows,
+        game_genre_rows,
+        game_tag_rows,
+        game_platform_rows,
+        game_language_rows,
+    )
 
 
 def make_user_game_sets(
@@ -307,8 +469,8 @@ def make_user_game_sets(
                     "user_id": user_id,
                     "game_id": game_id,
                     "added_at": dt_to_iso(added_at),
-                    "source": source,
-                    "is_wishlist": random.random() < 0.22,
+                    "source": maybe_none(source, cfg, 0.9),
+                    "is_wishlist": maybe_none(random.random() < 0.22, cfg, 0.35),
                 }
             )
 
@@ -320,9 +482,13 @@ def make_user_game_sets(
                     "user_id": user_id,
                     "game_id": game_id,
                     "added_at": dt_to_iso(added_at),
-                    "reason": weighted_choice(
-                        ["not_interested", "too_expensive", "bad_reviews", "wrong_genre", "already_played_elsewhere"],
-                        [0.46, 0.18, 0.16, 0.14, 0.06],
+                    "reason": maybe_none(
+                        weighted_choice(
+                            ["not_interested", "too_expensive", "bad_reviews", "wrong_genre", "already_played_elsewhere"],
+                            [0.46, 0.18, 0.16, 0.14, 0.06],
+                        ),
+                        cfg,
+                        1.25,
                     ),
                 }
             )
@@ -369,11 +535,11 @@ def make_game_stats_and_reviews(
                 "game_id": game_id,
                 "completion_status": status,
                 "playtime_minutes": playtime,
-                "sessions_count": 0 if playtime == 0 else random.randint(1, max(1, playtime // 20)),
-                "first_played_at": None if playtime == 0 else dt_to_iso(random_dt(added_at, cfg.end_date)),
-                "last_played_at": None if last_played_at is None else dt_to_iso(last_played_at),
-                "achievements_total": achievements_total,
-                "achievements_unlocked": achievements_unlocked,
+                "sessions_count": maybe_none(0 if playtime == 0 else random.randint(1, max(1, playtime // 20)), cfg, 0.25),
+                "first_played_at": None if playtime == 0 else maybe_none(dt_to_iso(random_dt(added_at, cfg.end_date)), cfg, 0.25),
+                "last_played_at": None if last_played_at is None else maybe_none(dt_to_iso(last_played_at), cfg, 0.25),
+                "achievements_total": maybe_none(achievements_total, cfg, 0.2),
+                "achievements_unlocked": maybe_none(achievements_unlocked, cfg, 0.2),
             }
         )
 
@@ -389,10 +555,10 @@ def make_game_stats_and_reviews(
                     "rating": rating,
                     "review_text": f"synthetic review with rating {rating} for {game_id}",
                     "created_at": dt_to_iso(created_at),
-                    "updated_at": dt_to_iso(created_at + timedelta(days=random.randint(0, 30))),
-                    "is_spoiler": random.random() < 0.08,
-                    "likes_count": random.randint(0, 500),
-                    "dislikes_count": random.randint(0, 80),
+                    "updated_at": maybe_none(dt_to_iso(created_at + timedelta(days=random.randint(0, 30))), cfg, 0.9),
+                    "is_spoiler": maybe_none(random.random() < 0.08, cfg, 0.25),
+                    "likes_count": maybe_none(random.randint(0, 500), cfg, 0.2),
+                    "dislikes_count": maybe_none(random.randint(0, 80), cfg, 0.2),
                 }
             )
 
@@ -420,9 +586,9 @@ def make_campaigns(
                 "placement": random.choice(PLACEMENTS),
                 "started_at": dt_to_iso(start_at),
                 "ended_at": dt_to_iso(end_at),
-                "budget_usd": round(random.uniform(100, 10000), 2),
-                "bid_cpc_usd": round(random.uniform(0.05, 2.50), 2),
-                "target_country": random.choice(COUNTRIES + ["all"]),
+                "budget_usd": maybe_none(round(random.uniform(100, 10000), 2), cfg, 0.2),
+                "bid_cpc_usd": maybe_none(round(random.uniform(0.05, 2.50), 2), cfg, 0.45),
+                "target_country": maybe_dirty_country(random.choice(COUNTRIES + ["all"]), cfg),
                 "campaign_status": "finished" if end_at < cfg.end_date else "active",
             }
         )
@@ -454,7 +620,13 @@ def make_events(
         occurred_at: datetime,
         campaign_id: str | None = None,
         review_id: str | None = None,
-        extra: dict[str, Any] | None = None,
+        source: str | None = None,
+        reason: str | None = None,
+        page: str | None = None,
+        referrer: str | None = None,
+        placement: str | None = None,
+        target_country: str | None = None,
+        review_reaction: str | None = None,
     ) -> None:
         event_id = f"evt_{len(events) + 1:012d}"
         payload = {
@@ -466,9 +638,15 @@ def make_events(
             "campaign_id": campaign_id,
             "review_id": review_id,
             "session_id": f"s_{random.randint(1, max(cfg.users * 5, 1)):010d}",
-            "device_type": weighted_choice(["desktop", "mobile", "tablet", "console"], [0.58, 0.24, 0.06, 0.12]),
-            "country": random.choice(COUNTRIES),
-            "properties": extra or {},
+            "device_type": maybe_none(weighted_choice(["desktop", "mobile", "tablet", "console"], [0.58, 0.24, 0.06, 0.12]), cfg, 0.35),
+            "country": maybe_dirty_country(random.choice(COUNTRIES), cfg),
+            "source": source,
+            "reason": reason,
+            "page": page,
+            "referrer": referrer,
+            "placement": placement,
+            "target_country": target_country,
+            "review_reaction": review_reaction,
         }
         events.append(payload)
 
@@ -481,7 +659,7 @@ def make_events(
                 user_id=row["user_id"],
                 game_id=row["game_id"],
                 occurred_at=datetime.fromisoformat(row["added_at"].replace("Z", "+00:00")),
-                extra={"source": row["source"]},
+                source=row["source"],
             )
 
     for row in anti_rows:
@@ -491,7 +669,7 @@ def make_events(
                 user_id=row["user_id"],
                 game_id=row["game_id"],
                 occurred_at=datetime.fromisoformat(row["added_at"].replace("Z", "+00:00")),
-                extra={"reason": row["reason"]},
+                reason=row["reason"],
             )
 
     # Random behavioral events until required volume.
@@ -516,10 +694,8 @@ def make_events(
                 game_id=campaign["game_id"],
                 occurred_at=occurred_at,
                 campaign_id=campaign_id,
-                extra={
-                    "placement": campaign["placement"],
-                    "target_country": campaign["target_country"],
-                },
+                placement=campaign["placement"],
+                target_country=campaign["target_country"],
             )
 
         elif event_type == "review_view" and review_ids:
@@ -530,9 +706,7 @@ def make_events(
                 game_id=review["game_id"],
                 occurred_at=occurred_at,
                 review_id=review["review_id"],
-                extra={
-                    "reaction": weighted_choice(REVIEW_REACTIONS + ["none"], [0.14, 0.04, 0.05, 0.12, 0.65]),
-                },
+                review_reaction=weighted_choice(REVIEW_REACTIONS + ["none"], [0.14, 0.04, 0.05, 0.12, 0.65]),
             )
 
         else:
@@ -541,10 +715,8 @@ def make_events(
                 user_id=user_id,
                 game_id=random.choice(game_ids),
                 occurred_at=occurred_at,
-                extra={
-                    "page": random.choice(["catalog", "game", "genre", "search", "recommendations"]),
-                    "referrer": random.choice(["direct", "search", "friend", "promo", "review"]),
-                },
+                page=random.choice(["catalog", "game", "genre", "search", "recommendations"]),
+                referrer=random.choice(["direct", "search", "friend", "promo", "review"]),
             )
 
     events.sort(key=lambda e: e["occurred_at"])
@@ -556,6 +728,14 @@ def validate_consistency(
     developers: list[dict[str, Any]],
     games: list[dict[str, Any]],
     published_games: list[dict[str, Any]],
+    genre_rows: list[dict[str, Any]],
+    tag_rows: list[dict[str, Any]],
+    platform_rows: list[dict[str, Any]],
+    language_rows: list[dict[str, Any]],
+    game_genre_rows: list[dict[str, Any]],
+    game_tag_rows: list[dict[str, Any]],
+    game_platform_rows: list[dict[str, Any]],
+    game_language_rows: list[dict[str, Any]],
     library_rows: list[dict[str, Any]],
     anti_rows: list[dict[str, Any]],
     stats_rows: list[dict[str, Any]],
@@ -566,6 +746,10 @@ def validate_consistency(
     user_ids = {u["user_id"] for u in users}
     developer_ids = {d["developer_id"] for d in developers}
     game_ids = {g["game_id"] for g in games}
+    genre_ids = {g["genre_id"] for g in genre_rows}
+    tag_ids = {t["tag_id"] for t in tag_rows}
+    platform_ids = {p["platform_id"] for p in platform_rows}
+    language_ids = {l["language_id"] for l in language_rows}
     game_to_dev = {g["game_id"]: g["developer_id"] for g in games}
     campaign_ids = {c["campaign_id"] for c in campaigns}
     review_ids = {r["review_id"] for r in review_rows}
@@ -583,6 +767,31 @@ def validate_consistency(
         if row["developer_id"] not in developer_ids:
             errors.append(f"game {row['game_id']} has missing developer_id")
 
+        if row["added_by_type"] not in {"developer", "user"}:
+            errors.append(f"game {row['game_id']} has invalid added_by_type")
+
+        if row["added_by_type"] == "developer":
+            if row["added_by_developer_id"] != row["developer_id"]:
+                errors.append(f"game {row['game_id']} added by developer mismatch")
+            if row["added_by_user_id"] is not None:
+                errors.append(f"game {row['game_id']} has user adder for developer-added game")
+
+        if row["added_by_type"] == "user":
+            if row["added_by_user_id"] not in user_ids:
+                errors.append(f"game {row['game_id']} has missing added_by_user_id")
+            if row["added_by_developer_id"] is not None:
+                errors.append(f"game {row['game_id']} has developer adder for user-added game")
+
+    developer_added_game_ids = {
+        row["game_id"]
+        for row in games
+        if row["added_by_type"] == "developer"
+    }
+    developer_portal_game_ids = {row["game_id"] for row in published_games}
+
+    if developer_portal_game_ids != developer_added_game_ids:
+        errors.append("developer_portal/published_games.csv must contain exactly developer-added games")
+
     for row in published_games:
         if row["developer_id"] not in developer_ids:
             errors.append(f"published game {row['game_id']} has missing developer_id")
@@ -590,6 +799,64 @@ def validate_consistency(
             errors.append(f"published game {row['game_id']} is missing in catalog")
         if row["game_id"] in game_to_dev and row["developer_id"] != game_to_dev[row["game_id"]]:
             errors.append(f"published game {row['game_id']} developer mismatch")
+        if row["game_id"] not in developer_added_game_ids:
+            errors.append(f"published game {row['game_id']} was not added by developer")
+
+    game_genre_pairs = {(row["game_id"], row["genre_id"]) for row in game_genre_rows}
+    game_tag_pairs = {(row["game_id"], row["tag_id"]) for row in game_tag_rows}
+    game_platform_pairs = {(row["game_id"], row["platform_id"]) for row in game_platform_rows}
+    game_language_pairs = {(row["game_id"], row["language_id"]) for row in game_language_rows}
+
+    if len(game_genre_pairs) != len(game_genre_rows):
+        errors.append("game_genres.csv has duplicate game_id + genre_id pairs")
+
+    if len(game_tag_pairs) != len(game_tag_rows):
+        errors.append("game_tags.csv has duplicate game_id + tag_id pairs")
+
+    if len(game_platform_pairs) != len(game_platform_rows):
+        errors.append("game_platforms.csv has duplicate game_id + platform_id pairs")
+
+    if len(game_language_pairs) != len(game_language_rows):
+        errors.append("game_languages.csv has duplicate game_id + language_id pairs")
+
+    games_with_genre = {row["game_id"] for row in game_genre_rows}
+    games_with_primary_genre = {row["game_id"] for row in game_genre_rows if row["is_primary"] is True}
+    games_with_platform = {row["game_id"] for row in game_platform_rows}
+    games_with_language = {row["game_id"] for row in game_language_rows}
+
+    for game_id in game_ids:
+        if game_id not in games_with_genre:
+            errors.append(f"game {game_id} has no genres")
+        if game_id not in games_with_primary_genre:
+            errors.append(f"game {game_id} has no primary genre")
+        if game_id not in games_with_platform:
+            errors.append(f"game {game_id} has no platforms")
+        if game_id not in games_with_language:
+            errors.append(f"game {game_id} has no languages")
+
+    for row in game_genre_rows:
+        if row["game_id"] not in game_ids:
+            errors.append(f"game_genres row has missing game_id {row['game_id']}")
+        if row["genre_id"] not in genre_ids:
+            errors.append(f"game_genres row has missing genre_id {row['genre_id']}")
+
+    for row in game_tag_rows:
+        if row["game_id"] not in game_ids:
+            errors.append(f"game_tags row has missing game_id {row['game_id']}")
+        if row["tag_id"] not in tag_ids:
+            errors.append(f"game_tags row has missing tag_id {row['tag_id']}")
+
+    for row in game_platform_rows:
+        if row["game_id"] not in game_ids:
+            errors.append(f"game_platforms row has missing game_id {row['game_id']}")
+        if row["platform_id"] not in platform_ids:
+            errors.append(f"game_platforms row has missing platform_id {row['platform_id']}")
+
+    for row in game_language_rows:
+        if row["game_id"] not in game_ids:
+            errors.append(f"game_languages row has missing game_id {row['game_id']}")
+        if row["language_id"] not in language_ids:
+            errors.append(f"game_languages row has missing language_id {row['language_id']}")
 
     for row in library_rows + anti_rows:
         if row["user_id"] not in user_ids:
@@ -601,9 +868,21 @@ def validate_consistency(
         if (row["user_id"], row["game_id"]) not in library_pairs:
             errors.append(f"stats row is not based on library pair: {row['user_id']}, {row['game_id']}")
 
+    for row in users:
+        if not row["username"]:
+            errors.append(f"user {row['user_id']} has empty username")
+        if not row["email"]:
+            errors.append(f"user {row['user_id']} has empty email")
+
     for row in review_rows:
         if (row["user_id"], row["game_id"]) not in library_pairs:
             errors.append(f"review row is not based on library pair: {row['user_id']}, {row['game_id']}")
+        if not row["review_text"]:
+            errors.append(f"review {row['review_id']} has empty review_text")
+        if row["rating"] is None:
+            errors.append(f"review {row['review_id']} has empty rating")
+        if row["rating"] is not None and not 1 <= int(row["rating"]) <= 5:
+            errors.append(f"review {row['review_id']} has invalid rating")
 
     for row in campaigns:
         if row["game_id"] not in game_ids:
@@ -632,6 +911,14 @@ def save_outputs(
     developers: list[dict[str, Any]],
     games: list[dict[str, Any]],
     published_games: list[dict[str, Any]],
+    genre_rows: list[dict[str, Any]],
+    tag_rows: list[dict[str, Any]],
+    platform_rows: list[dict[str, Any]],
+    language_rows: list[dict[str, Any]],
+    game_genre_rows: list[dict[str, Any]],
+    game_tag_rows: list[dict[str, Any]],
+    game_platform_rows: list[dict[str, Any]],
+    game_language_rows: list[dict[str, Any]],
     library_rows: list[dict[str, Any]],
     anti_rows: list[dict[str, Any]],
     stats_rows: list[dict[str, Any]],
@@ -659,6 +946,54 @@ def save_outputs(
 
     with (dirs["game_catalog"] / "games.json").open("w", encoding="utf-8") as file:
         json.dump(games, file, ensure_ascii=False, indent=2)
+
+    write_csv(
+        dirs["game_catalog"] / "genres.csv",
+        genre_rows,
+        ["genre_id", "genre_name", "created_at"],
+    )
+
+    write_csv(
+        dirs["game_catalog"] / "tags.csv",
+        tag_rows,
+        ["tag_id", "tag_name", "created_at"],
+    )
+
+    write_csv(
+        dirs["game_catalog"] / "platforms.csv",
+        platform_rows,
+        ["platform_id", "platform_name", "created_at"],
+    )
+
+    write_csv(
+        dirs["game_catalog"] / "languages.csv",
+        language_rows,
+        ["language_id", "language_code", "created_at"],
+    )
+
+    write_csv(
+        dirs["game_catalog"] / "game_genres.csv",
+        game_genre_rows,
+        ["game_id", "genre_id", "is_primary", "position"],
+    )
+
+    write_csv(
+        dirs["game_catalog"] / "game_tags.csv",
+        game_tag_rows,
+        ["game_id", "tag_id"],
+    )
+
+    write_csv(
+        dirs["game_catalog"] / "game_platforms.csv",
+        game_platform_rows,
+        ["game_id", "platform_id"],
+    )
+
+    write_csv(
+        dirs["game_catalog"] / "game_languages.csv",
+        game_language_rows,
+        ["game_id", "language_id"],
+    )
 
     write_csv(
         dirs["library_service"] / "library.csv",
@@ -714,6 +1049,7 @@ def parse_args() -> Config:
     parser.add_argument("--anti-library-max", type=int, default=8)
     parser.add_argument("--campaigns", type=int, default=250)
     parser.add_argument("--events", type=int, default=150000)
+    parser.add_argument("--dirty-rate", type=float, default=0.03)
     parser.add_argument("--start-date", type=str, default="2025-01-01")
     parser.add_argument("--end-date", type=str, default="2026-06-01")
 
@@ -737,6 +1073,9 @@ def parse_args() -> Config:
     if args.library_max + args.anti_library_max > args.games:
         raise ValueError("--library-max + --anti-library-max must be <= --games")
 
+    if not 0 <= args.dirty_rate <= 0.2:
+        raise ValueError("--dirty-rate must be between 0 and 0.2")
+
     return Config(
         out=args.out,
         seed=args.seed,
@@ -749,6 +1088,7 @@ def parse_args() -> Config:
         anti_library_max=args.anti_library_max,
         campaigns=args.campaigns,
         events=args.events,
+        dirty_rate=args.dirty_rate,
         start_date=start_date,
         end_date=end_date,
     )
@@ -762,7 +1102,18 @@ def main() -> None:
 
     users = make_users(cfg)
     developers = make_developers(cfg)
-    games, published_games = make_games(cfg, developers)
+    (
+        games,
+        published_games,
+        genre_rows,
+        tag_rows,
+        platform_rows,
+        language_rows,
+        game_genre_rows,
+        game_tag_rows,
+        game_platform_rows,
+        game_language_rows,
+    ) = make_games(cfg, users, developers)
     library_rows, anti_rows, _, _ = make_user_game_sets(cfg, users, games)
     stats_rows, review_rows = make_game_stats_and_reviews(cfg, library_rows)
     campaigns = make_campaigns(cfg, games)
@@ -773,6 +1124,14 @@ def main() -> None:
         developers=developers,
         games=games,
         published_games=published_games,
+        genre_rows=genre_rows,
+        tag_rows=tag_rows,
+        platform_rows=platform_rows,
+        language_rows=language_rows,
+        game_genre_rows=game_genre_rows,
+        game_tag_rows=game_tag_rows,
+        game_platform_rows=game_platform_rows,
+        game_language_rows=game_language_rows,
         library_rows=library_rows,
         anti_rows=anti_rows,
         stats_rows=stats_rows,
@@ -787,6 +1146,14 @@ def main() -> None:
         developers=developers,
         games=games,
         published_games=published_games,
+        genre_rows=genre_rows,
+        tag_rows=tag_rows,
+        platform_rows=platform_rows,
+        language_rows=language_rows,
+        game_genre_rows=game_genre_rows,
+        game_tag_rows=game_tag_rows,
+        game_platform_rows=game_platform_rows,
+        game_language_rows=game_language_rows,
         library_rows=library_rows,
         anti_rows=anti_rows,
         stats_rows=stats_rows,
@@ -795,6 +1162,7 @@ def main() -> None:
         events=events,
     )
 
+    print(f"soft dirty data rate: {cfg.dirty_rate}")
     print_summary(
         cfg.out,
         {
@@ -802,6 +1170,16 @@ def main() -> None:
             "developers.csv": len(developers),
             "published_games.csv": len(published_games),
             "games.json": len(games),
+            "developer_added_games": sum(1 for row in games if row["added_by_type"] == "developer"),
+            "user_added_games": sum(1 for row in games if row["added_by_type"] == "user"),
+            "genres.csv": len(genre_rows),
+            "tags.csv": len(tag_rows),
+            "platforms.csv": len(platform_rows),
+            "languages.csv": len(language_rows),
+            "game_genres.csv": len(game_genre_rows),
+            "game_tags.csv": len(game_tag_rows),
+            "game_platforms.csv": len(game_platform_rows),
+            "game_languages.csv": len(game_language_rows),
             "library.csv": len(library_rows),
             "anti_library.ndjson": len(anti_rows),
             "reviews.csv": len(review_rows),

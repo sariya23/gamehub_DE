@@ -1,0 +1,8 @@
+platform_id,platform_name,created_at
+platform_001,windows,2025-01-01T00:00:00Z
+platform_002,macos,2025-01-01T00:00:00Z
+platform_003,linux,2025-01-01T00:00:00Z
+platform_004,steam_deck,2025-01-01T00:00:00Z
+platform_005,playstation,2025-01-01T00:00:00Z
+platform_006,xbox,2025-01-01T00:00:00Z
+platform_007,nintendo_switch,2025-01-01T00:00:00Z
